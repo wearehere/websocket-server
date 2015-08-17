@@ -235,7 +235,7 @@ void wsMakeFrame(const uint8_t *data, size_t dataLength,
     *outLength+= dataLength;
 }
 
-static size_t getPayloadLength(const uint8_t *inputFrame, size_t inputLength,
+size_t getPayloadLength(const uint8_t *inputFrame, size_t inputLength,
                                uint8_t *payloadFieldExtraBytes, enum wsFrameType *frameType) 
 {
     size_t payloadLength = inputFrame[1] & 0x7F;

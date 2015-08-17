@@ -54,7 +54,6 @@ typedef struct{
     int authed;
     char* prunurl;
     pthread_t pt;
-    uint8_t *msgbuf;
 }ClientTaskInfo;
 
 //void clientWorker(int clientSocket, char* pmsgbuf);
@@ -108,7 +107,6 @@ void runClientThread(int fd){
     memset(pclitask, 0x00, sizeof(ClientTaskInfo));
     pclitask->sockfd = fd;
     pclitask->runflag = 1;
-    pclitask->msgbuf = (char*)malloc(BUF_LEN);
     pthread_create(&pclitask->pt, NULL, taskThreadFunc, pclitask);
     list_node_t *pnewnode = list_node_new(pclitask);
     list_rpush(ptasklist, pnewnode);
@@ -125,7 +123,6 @@ void checkDeadThread(){
             LOG("checkDeadThread:remove one Dead thread")
             list_remove(ptasklist, node);
             FREE_MEM(ptask->prunurl)
-            FREE_MEM(ptask->msgbuf)
             free(ptask);
             break;            
         }
@@ -198,27 +195,145 @@ int safeSend(int clientSocket, const uint8_t *buffer, size_t bufferSize)
     return EXIT_SUCCESS;
 }
 
-//void clientWorker(int clientSocket, char* pmsgbuf)
-void clientWorker(ClientTaskInfo* pinfo)
-{
-    int clientSocket = pinfo->sockfd;
-    char* pmsgbuf = pinfo->msgbuf;
+
+
+int openingClientState(char* inmsg, int inmsglen,
+        char* outmsg, int* outmsglen, enum wsState * state, char** purl){
+    struct handshake hs;
+    enum wsFrameType frameType = WS_INCOMPLETE_FRAME;
+    nullHandshake(&hs);
     
-    memset(pmsgbuf, 0, BUF_LEN);
-    size_t readedLength = 0;
-    size_t frameSize = BUF_LEN;
-    enum wsState state = WS_STATE_OPENING;
+    frameType = wsParseHandshake(inmsg, inmsglen, &hs);
+    if(frameType == WS_OPENING_FRAME){
+        fprintf(stdout, "[openingClientState hs.resource]:%s\n", hs.resource);
+        COPYSTR((*purl), hs.resource)
+        wsGetHandshakeAnswer(&hs, outmsg, (size_t*)outmsglen);
+        freeHandshake(&hs);
+        *state = WS_STATE_NORMAL;
+        return 0;
+    }
+    
+    assert(frameType != WS_INCOMPLETE_FRAME);
+    
+    if(frameType == WS_ERROR_FRAME)
+        printf("[openingClientState]error in incoming frame\n");
+    else
+        printf("[openingClientState]error frametype %02X\n", frameType);
+        
+    (*outmsglen) = sprintf((char *)outmsg,
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "%s%s\r\n\r\n",
+                        versionField,
+                        version);        
+    return -1;
+}
+
+int normalClientState(char* inmsg, int inmsglen,
+        char* outmsg, int* outmsglen, enum wsState * state){
+
     uint8_t *data = NULL;
     size_t dataSize = 0;
     enum wsFrameType frameType = WS_INCOMPLETE_FRAME;
-    struct handshake hs;
-    nullHandshake(&hs);
+    frameType = wsParseInputFrame(inmsg, inmsglen, &data, &dataSize);
+
+    assert(frameType != WS_INCOMPLETE_FRAME);
+    if (frameType == WS_TEXT_FRAME) {
+        uint8_t *recievedString = NULL;
+        recievedString = malloc(dataSize+1);
+        assert(recievedString);
+        memcpy(recievedString, data, dataSize);
+        recievedString[ dataSize ] = 0;
+        
+        fprintf(stdout, "RECV:%s\n", recievedString);
+        char* presp = runScript(appoption.pcgiscript, recievedString);
+        if(presp != NULL){
+            fprintf(stdout, "SCRIPT RESP:%s\n", presp);
+            wsMakeFrame(presp, strlen(presp), outmsg, (size_t*)outmsglen, WS_TEXT_FRAME);
+            //wsMakeFrame(recievedString, dataSize, gBuffer, &frameSize, WS_TEXT_FRAME);
+            free(presp);
+        }
+        free(recievedString);
+        return 0;
+    }else if(frameType == WS_CLOSING_FRAME){
+        fprintf(stdout, "[normalClientState]WS_CLOSING_FRAME\n");
+        wsMakeFrame(NULL, 0, outmsg, (size_t*)outmsglen, WS_CLOSING_FRAME);
+        return -1;
+    }else{
+        if(frameType == WS_ERROR_FRAME)
+            printf("[normalClientState]error in incoming frame\n");
+        else
+            printf("[normalClientState]unsupport frame type %02X\n", frameType);
+        wsMakeFrame(NULL, 0, outmsg, (size_t*)outmsglen, WS_CLOSING_FRAME);
+        *state = WS_STATE_CLOSING;
+        return 0; 
+    }    
+}
+
+int closingClientState(char* inmsg, int inmsglen,
+        char* outmsg, int* outmsglen, enum wsState * state){
+    uint8_t *data = NULL;
+    size_t dataSize = 0;
+            
+    enum wsFrameType frameType = WS_INCOMPLETE_FRAME;
+    assert(frameType != WS_INCOMPLETE_FRAME);
+    fprintf(stdout, "[closingClientState]entry\n");
+    frameType = wsParseInputFrame(inmsg, inmsglen, &data, &dataSize);
     
-    #define prepareBuffer frameSize = BUF_LEN; memset(pmsgbuf, 0, BUF_LEN);
-    #define initNewFrame frameType = WS_INCOMPLETE_FRAME; readedLength = 0; memset(pmsgbuf, 0, BUF_LEN);
+    *outmsglen = 0;
+    if(frameType == WS_CLOSING_FRAME){
+        fprintf(stdout, "[closingClientState]WS_CLOSING_FRAME\n");
+        return -1;
+    }else{
+        fprintf(stdout, "[closingClientState]ignore other message type\n");
+        return 0;
+    }
+}        
+
+int checkCompleteMessage(int state, char* pmsg, int length){
+    enum wsFrameType frameType = WS_INCOMPLETE_FRAME;
+    char* pos = NULL;
+    if(state == WS_STATE_OPENING){
+        pos = strstr(pmsg, "\r\n\r\n");     
+        if(pos == NULL)
+            return -1;
+        return pos -pmsg + 4;
+    }else{
+        uint8_t payloadFieldExtraBytes = 0;
+        size_t payloadLength = getPayloadLength(pmsg, length,
+                                                &payloadFieldExtraBytes, &frameType);
+        if(payloadLength + 6 + payloadFieldExtraBytes > length)
+            return -1;
+        return payloadLength + 6 + payloadFieldExtraBytes;
+    }
+}
+
+void clientWorker(ClientTaskInfo* pinfo){
     
-    while (frameType == WS_INCOMPLETE_FRAME) {
-        ssize_t readed = recv(clientSocket, pmsgbuf+readedLength, BUF_LEN-readedLength, 0);
+    int clientSocket = pinfo->sockfd;
+    size_t readedLength = 0;
+    size_t frameSize = BUF_LEN;
+    enum wsState state = WS_STATE_OPENING;
+    int ret = 0;
+    int pos = 0;
+    int usedbytes = 0;
+    
+    char* pinmsgbuf = (char*)malloc(BUF_LEN);
+    char* poutmsg = (char*)malloc(BUF_LEN);
+    int outmsglen = 0;
+    int inmsglen = 0;
+    
+    memset(pinmsgbuf, 0x00, sizeof(BUF_LEN));
+    memset(poutmsg, 0x00, sizeof(BUF_LEN));
+
+    while(1){
+        
+        if(BUF_LEN == readedLength){
+            printf("[clientWorker]buffer too small");
+            ret = -1;
+            break;
+        }
+        
+        ssize_t readed = recv(clientSocket, pinmsgbuf+readedLength, BUF_LEN-readedLength, 0);
         if (readed <= 0) {
             close(clientSocket);
             fprintf(stdout, "[clientWorker]readed <= 0\n");
@@ -228,117 +343,59 @@ void clientWorker(ClientTaskInfo* pinfo)
         #ifdef PACKET_DUMP
         printf("in packet:%d\n", (int)readed);
         //fwrite(pmsgbuf, 1, readed, stdout);
-        LOG_HEX(pmsgbuf, readed);
+        LOG_HEX(pinmsgbuf+readedLength, readed);
         //printf("\n");
         #endif
         readedLength+= readed;
         assert(readedLength <= BUF_LEN);
-        
-        if (state == WS_STATE_OPENING) {
-            frameType = wsParseHandshake(pmsgbuf, readedLength, &hs);
-        } else {
-            frameType = wsParseInputFrame(pmsgbuf, readedLength, &data, &dataSize);
-        }
-        
-        if ((frameType == WS_INCOMPLETE_FRAME && readedLength == BUF_LEN) || frameType == WS_ERROR_FRAME) {
-            if (frameType == WS_INCOMPLETE_FRAME)
-                printf("buffer too small");
-            else
-                printf("error in incoming frame\n");
-            
-            if (state == WS_STATE_OPENING) {
-                prepareBuffer;
-                frameSize = sprintf((char *)pmsgbuf,
-                                    "HTTP/1.1 400 Bad Request\r\n"
-                                    "%s%s\r\n\r\n",
-                                    versionField,
-                                    version);
-                safeSend(clientSocket, pmsgbuf, frameSize);
-                fprintf(stdout, "[clientWorker]WS_INCOMPLETE_FRAME  && WS_STATE_OPENING\n");
+        usedbytes = 0;
+
+        while(1){
+            int completemsglen = checkCompleteMessage(state, pinmsgbuf + usedbytes, readedLength - usedbytes);
+            if(completemsglen == -1){
+                ret = 0;
+                if(usedbytes > 0){
+                    memcpy(pinmsgbuf, pinmsgbuf + usedbytes, readedLength - usedbytes);
+                    readedLength -= usedbytes;         
+                    usedbytes = 0;         
+                }
                 break;
-            } else {
-                prepareBuffer;
-                wsMakeFrame(NULL, 0, pmsgbuf, &frameSize, WS_CLOSING_FRAME);
-                if (safeSend(clientSocket, pmsgbuf, frameSize) == EXIT_FAILURE){
-                    fprintf(stdout, "[clientWorker]WS_INCOMPLETE_FRAME\n");
-                    break;                    
-                }
-                state = WS_STATE_CLOSING;
-                initNewFrame;
+            }
+            
+            outmsglen = BUF_LEN;
+            if(state == WS_STATE_OPENING){
+                ret = openingClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, &state, &(pinfo->prunurl));
+            }else if(state == WS_STATE_NORMAL){
+                ret = normalClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, &state);
+            }else if(state == WS_STATE_CLOSING){
+                ret = closingClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, &state);
+            }else{
+                fprintf(stdout, "[clientWorker]unknown state\n");
+                ret = -1;
+            }            
+            
+            usedbytes += completemsglen;
+            if(outmsglen > 0){
+                if (safeSend(clientSocket, poutmsg, outmsglen) == EXIT_FAILURE){
+                    fprintf(stdout, "[clientWorker]safeSend error\n");      
+                    ret = -1;                  
+                    break;
+                }                
+            }
+            memset(poutmsg, 0x00, sizeof(BUF_LEN)); outmsglen = 0;
+            if(ret == -1){
+                break;
             }
         }
         
-        if (state == WS_STATE_OPENING) {
-            assert(frameType == WS_OPENING_FRAME);
-            if (frameType == WS_OPENING_FRAME) {
-                // if resource is right, generate answer handshake and send it
-                // if (strcmp(hs.resource, "/echo") != 0) {
-                //     frameSize = sprintf((char *)pmsgbuf, "HTTP/1.1 404 Not Found\r\n\r\n");
-                //     safeSend(clientSocket, pmsgbuf, frameSize);
-                //     break;
-                // }
-                
-                fprintf(stdout, "[hs.resource]:%s\n", hs.resource);
-                //TODO use token as URL, check TOKEN or PASSWD, invoke TOKEN auth script
-                COPYSTR(pinfo->prunurl, hs.resource)
-                //char* pret = runScript(appinfo.pauthscript, hs.resource);
-                //if(strcmp(pret, "true"))
-                //{ safeSend("invalid user.")
-                //  free(pret); break;
-                //}
-                //free(pret)
-                
-                prepareBuffer;
-                wsGetHandshakeAnswer(&hs, pmsgbuf, &frameSize);
-                freeHandshake(&hs);
-                if (safeSend(clientSocket, pmsgbuf, frameSize) == EXIT_FAILURE){
-                    fprintf(stdout, "[clientWorker]safeSend error\n");
-                    break;                    
-                }
-                state = WS_STATE_NORMAL;
-                initNewFrame;
-            }
-        } else {
-            if (frameType == WS_CLOSING_FRAME) {
-                fprintf(stdout, "[clientWorker]WS_CLOSING_FRAME\n");
-                if (state == WS_STATE_CLOSING) {
-                    break;
-                } else {
-                    prepareBuffer;
-                    wsMakeFrame(NULL, 0, pmsgbuf, &frameSize, WS_CLOSING_FRAME);
-                    safeSend(clientSocket, pmsgbuf, frameSize);
-                    break;
-                }
-            } else if (frameType == WS_TEXT_FRAME) {
-                uint8_t *recievedString = NULL;
-                recievedString = malloc(dataSize+1);
-                assert(recievedString);
-                memcpy(recievedString, data, dataSize);
-                recievedString[ dataSize ] = 0;
-                
-                fprintf(stdout, "RECV:%s\n", recievedString);
-                char* presp = runScript(appoption.pcgiscript, recievedString);
-                if(presp != NULL){
-                    fprintf(stdout, "SCRIPT RESP:%s\n", presp);
-                    prepareBuffer;
-                    wsMakeFrame(presp, strlen(presp), pmsgbuf, &frameSize, WS_TEXT_FRAME);
-                    //wsMakeFrame(recievedString, dataSize, gBuffer, &frameSize, WS_TEXT_FRAME);
-                    free(presp);
-                    
-                    if (safeSend(clientSocket, pmsgbuf, frameSize) == EXIT_FAILURE){
-                        free(recievedString);
-                        fprintf(stdout, "[clientWorker]safeSend error\n");                        
-                        break;
-                    }
-                }
-                free(recievedString);
-                initNewFrame;
-            }
+        if(ret == -1){
+            break;            
         }
-    } // read/write cycle
-    
-    fprintf(stdout, "[clientWorker]close socket, exit..\n");
+    }
+    fprintf(stdout, "[clientWorker]exit\n");
     close(clientSocket);
+    free(pinmsgbuf);
+    free(poutmsg);
 }
 
 void printUsage(char* appname){

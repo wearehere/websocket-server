@@ -51,7 +51,7 @@ fi
 
 ####runscript
 <pre><code>
-\#!/bin/sh
+#!/bin/sh
 echo $1
 </code></pre>
 
