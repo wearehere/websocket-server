@@ -251,6 +251,8 @@ int normalClientState(char* inmsg, int inmsglen,
             wsMakeFrame(presp, strlen(presp), outmsg, (size_t*)outmsglen, WS_TEXT_FRAME);
             //wsMakeFrame(recievedString, dataSize, gBuffer, &frameSize, WS_TEXT_FRAME);
             free(presp);
+        }else{
+            *outmsglen = 0;
         }
         free(recievedString);
         return 0;
