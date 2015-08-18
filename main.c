@@ -96,6 +96,7 @@ void LOG_HEX(char* pbuf, int len)
 //---------------TASK relate-----------------
 
 list_t *ptasklist = NULL;
+pthread_mutex_t taskListMutex;
 
 void *taskThreadFunc(void* param){
     LOG("taskThreadFunc")
@@ -117,30 +118,29 @@ void runClientThread(int fd){
 	pthread_mutex_init(&(pclitask->sendMsgMutex),NULL);
     pthread_create(&pclitask->pt, NULL, taskThreadFunc, pclitask);
     list_node_t *pnewnode = list_node_new(pclitask);
+	pthread_mutex_lock(&taskListMutex);
     list_rpush(ptasklist, pnewnode);
+	pthread_mutex_unlock(&taskListMutex);
 }
 
-void *checkDeadThread(void *param){
+void checkDeadThread(){
 	LOG("checkDeadThread")
-    pthread_detach(pthread_self());
-	while (1) {
-		ClientTaskInfo* ptask = NULL;
-	    list_node_t *node;
-	    list_iterator_t *it = list_iterator_new(ptasklist, LIST_HEAD);
-	    while ((node = list_iterator_next(it))) {
-	        ptask = (ClientTaskInfo*)(node->val);
-	        if(ptask->runflag == TASK_FLAG_IDLE){
-	            LOG("checkDeadThread:remove one Dead thread")
-	            list_remove(ptasklist, node);
-	            FREE_MEM(ptask->prunurl)
-		        pthread_mutex_destroy(&ptask->sendMsgMutex);
-	            free(ptask);
-	            break;
-	        }
-	    }
-	    list_iterator_destroy(it);
-		sleep(10);
-	}
+	ClientTaskInfo* ptask = NULL;
+    list_node_t *node;	
+	pthread_mutex_lock(&taskListMutex);
+    list_iterator_t *it = list_iterator_new(ptasklist, LIST_HEAD);
+    while ((node = list_iterator_next(it))) {
+        ptask = (ClientTaskInfo*)(node->val);
+        if(ptask->runflag == TASK_FLAG_IDLE){
+            LOG("checkDeadThread:remove one Dead thread")
+            list_remove(ptasklist, node);
+            FREE_MEM(ptask->prunurl)
+	        pthread_mutex_destroy(&ptask->sendMsgMutex);
+            free(ptask);
+        }
+    }
+    list_iterator_destroy(it);	
+	pthread_mutex_unlock(&taskListMutex);
 }
 
 
@@ -420,13 +420,14 @@ void broadcastMsg(char *msg, int size)
 {
     ClientTaskInfo* ptask = NULL;
     list_node_t *node;
-    list_iterator_t *it = list_iterator_new(ptasklist, LIST_HEAD);
-
+    list_iterator_t *it;
 	char *pmsgbuf = (char *)malloc(BUF_LEN);
 	size_t frameSize = BUF_LEN;
 	wsMakeFrame(msg, size, pmsgbuf, &frameSize, WS_TEXT_FRAME);
 	LOG("run broadcaseMsg")
 
+	pthread_mutex_lock(&taskListMutex);
+	it = list_iterator_new(ptasklist, LIST_HEAD);
     while ((node = list_iterator_next(it))) {
         ptask = (ClientTaskInfo*)(node->val);
         if ((ptask->runflag == TASK_FLAG_RUNNING) && (ptask->state == WS_STATE_NORMAL)) {
@@ -438,7 +439,7 @@ void broadcastMsg(char *msg, int size)
         }
     }
     list_iterator_destroy(it);
-
+	pthread_mutex_unlock(&taskListMutex);
 	if (pmsgbuf)
 		free(pmsgbuf);
 }
@@ -538,10 +539,10 @@ int main(int argc, char** argv)
     printf("opened %s:%d\n", inet_ntoa(local.sin_addr), ntohs(local.sin_port));
     
     ptasklist = list_new();
+	pthread_mutex_init(&taskListMutex,NULL);
 
-	pthread_t broadcaseThreadHandle, checkDeadThreadHandle;
+	pthread_t broadcaseThreadHandle;
     pthread_create(&broadcaseThreadHandle, NULL, readWebSockThreadFunc, NULL);
-	pthread_create(&checkDeadThreadHandle, NULL, checkDeadThread, NULL);
     
     while (TRUE) {
         struct sockaddr_in remote;
@@ -553,9 +554,7 @@ int main(int argc, char** argv)
         
         printf("connected %s:%d\n", inet_ntoa(remote.sin_addr), ntohs(remote.sin_port));
         runClientThread(clientSocket);
-        //checkDeadThread(NULL);
-        //clientWorker(clientSocket);
-        //printf("disconnected\n");
+        checkDeadThread();
     }
     
     close(listenSocket);
