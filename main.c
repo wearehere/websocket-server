@@ -245,14 +245,19 @@ int normalClientState(char* inmsg, int inmsglen,
         recievedString[ dataSize ] = 0;
         
         fprintf(stdout, "RECV:%s\n", recievedString);
-        char* presp = runScript(appoption.pcgiscript, recievedString);
-        if(presp != NULL){
-            fprintf(stdout, "SCRIPT RESP:%s\n", presp);
-            wsMakeFrame(presp, strlen(presp), outmsg, (size_t*)outmsglen, WS_TEXT_FRAME);
-            //wsMakeFrame(recievedString, dataSize, gBuffer, &frameSize, WS_TEXT_FRAME);
-            free(presp);
-        }else{
+        if(appoption.pcgiscript == NULL){
+            fprintf(stdout, "SCRIPT NULL\n");
             *outmsglen = 0;
+        }else{
+            char* presp = runScript(appoption.pcgiscript, recievedString);
+            if(presp != NULL){
+                fprintf(stdout, "SCRIPT RESP:%s\n", presp);
+                wsMakeFrame(presp, strlen(presp), outmsg, (size_t*)outmsglen, WS_TEXT_FRAME);
+                //wsMakeFrame(recievedString, dataSize, gBuffer, &frameSize, WS_TEXT_FRAME);
+                free(presp);
+            }else{
+                *outmsglen = 0;
+            }
         }
         free(recievedString);
         return 0;
