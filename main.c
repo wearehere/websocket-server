@@ -30,6 +30,10 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <limits.h>
+
 #include "list/list.h"
 #include "websocket.h"
 
@@ -53,6 +57,8 @@ typedef struct{
     int runflag;
     int authed;
     char* prunurl;
+    enum wsState state;
+    pthread_mutex_t sendMsgMutex;
     pthread_t pt;
 }ClientTaskInfo;
 
@@ -90,6 +96,7 @@ void LOG_HEX(char* pbuf, int len)
 //---------------TASK relate-----------------
 
 list_t *ptasklist = NULL;
+pthread_mutex_t taskListMutex;
 
 void *taskThreadFunc(void* param){
     LOG("taskThreadFunc")
@@ -107,15 +114,20 @@ void runClientThread(int fd){
     memset(pclitask, 0x00, sizeof(ClientTaskInfo));
     pclitask->sockfd = fd;
     pclitask->runflag = 1;
+	pclitask->state = WS_STATE_OPENING;
+	pthread_mutex_init(&(pclitask->sendMsgMutex),NULL);
     pthread_create(&pclitask->pt, NULL, taskThreadFunc, pclitask);
     list_node_t *pnewnode = list_node_new(pclitask);
+	pthread_mutex_lock(&taskListMutex);
     list_rpush(ptasklist, pnewnode);
+	pthread_mutex_unlock(&taskListMutex);
 }
 
 void checkDeadThread(){
-    LOG("checkDeadThread")
-    ClientTaskInfo* ptask = NULL;
-    list_node_t *node;
+	LOG("checkDeadThread")
+	ClientTaskInfo* ptask = NULL;
+    list_node_t *node;	
+	pthread_mutex_lock(&taskListMutex);
     list_iterator_t *it = list_iterator_new(ptasklist, LIST_HEAD);
     while ((node = list_iterator_next(it))) {
         ptask = (ClientTaskInfo*)(node->val);
@@ -123,11 +135,12 @@ void checkDeadThread(){
             LOG("checkDeadThread:remove one Dead thread")
             list_remove(ptasklist, node);
             FREE_MEM(ptask->prunurl)
+	        pthread_mutex_destroy(&ptask->sendMsgMutex);
             free(ptask);
-            break;            
         }
     }
-    list_iterator_destroy(it);
+    list_iterator_destroy(it);	
+	pthread_mutex_unlock(&taskListMutex);
 }
 
 
@@ -319,7 +332,7 @@ void clientWorker(ClientTaskInfo* pinfo){
     int clientSocket = pinfo->sockfd;
     size_t readedLength = 0;
     size_t frameSize = BUF_LEN;
-    enum wsState state = WS_STATE_OPENING;
+    enum wsState *pstate = &pinfo->state;
     int ret = 0;
     int pos = 0;
     int usedbytes = 0;
@@ -357,8 +370,8 @@ void clientWorker(ClientTaskInfo* pinfo){
         assert(readedLength <= BUF_LEN);
         usedbytes = 0;
 
-        while(1){
-            int completemsglen = checkCompleteMessage(state, pinmsgbuf + usedbytes, readedLength - usedbytes);
+        while(1) {
+            int completemsglen = checkCompleteMessage(*pstate, pinmsgbuf + usedbytes, readedLength - usedbytes);
             if(completemsglen == -1){
                 ret = 0;
                 if(usedbytes > 0){
@@ -370,12 +383,12 @@ void clientWorker(ClientTaskInfo* pinfo){
             }
             
             outmsglen = BUF_LEN;
-            if(state == WS_STATE_OPENING){
-                ret = openingClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, &state, &(pinfo->prunurl));
-            }else if(state == WS_STATE_NORMAL){
-                ret = normalClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, &state);
-            }else if(state == WS_STATE_CLOSING){
-                ret = closingClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, &state);
+            if(*pstate == WS_STATE_OPENING){
+                ret = openingClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, pstate, &(pinfo->prunurl));
+            }else if(*pstate == WS_STATE_NORMAL){
+                ret = normalClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, pstate);
+            }else if(*pstate == WS_STATE_CLOSING){
+                ret = closingClientState(pinmsgbuf + usedbytes, completemsglen, poutmsg, &outmsglen, pstate);
             }else{
                 fprintf(stdout, "[clientWorker]unknown state\n");
                 ret = -1;
@@ -383,7 +396,12 @@ void clientWorker(ClientTaskInfo* pinfo){
             
             usedbytes += completemsglen;
             if(outmsglen > 0){
-                if (safeSend(clientSocket, poutmsg, outmsglen) == EXIT_FAILURE){
+				int ret = EXIT_FAILURE;
+
+				pthread_mutex_lock(&pinfo->sendMsgMutex);
+				ret = safeSend(clientSocket, poutmsg, outmsglen);
+				pthread_mutex_unlock(&pinfo->sendMsgMutex);
+                if (ret == EXIT_FAILURE){
                     fprintf(stdout, "[clientWorker]safeSend error\n");      
                     ret = -1;                  
                     break;
@@ -403,6 +421,63 @@ void clientWorker(ClientTaskInfo* pinfo){
     close(clientSocket);
     free(pinmsgbuf);
     free(poutmsg);
+}
+
+void broadcastMsg(char *msg, int size)
+{
+    ClientTaskInfo* ptask = NULL;
+    list_node_t *node;
+    list_iterator_t *it;
+	char *pmsgbuf = (char *)malloc(BUF_LEN);
+	size_t frameSize = BUF_LEN;
+	wsMakeFrame(msg, size, pmsgbuf, &frameSize, WS_TEXT_FRAME);
+	LOG("run broadcaseMsg")
+
+	pthread_mutex_lock(&taskListMutex);
+	it = list_iterator_new(ptasklist, LIST_HEAD);
+    while ((node = list_iterator_next(it))) {
+        ptask = (ClientTaskInfo*)(node->val);
+        if ((ptask->runflag == TASK_FLAG_RUNNING) && (ptask->state == WS_STATE_NORMAL)) {
+            LOG("send msg to client");
+			pthread_mutex_lock(&ptask->sendMsgMutex);
+			safeSend(ptask->sockfd, pmsgbuf, frameSize);
+			pthread_mutex_unlock(&ptask->sendMsgMutex);
+
+        }
+    }
+    list_iterator_destroy(it);
+	pthread_mutex_unlock(&taskListMutex);
+	if (pmsgbuf)
+		free(pmsgbuf);
+}
+
+const char *fifoName = "/tmp/webSocketFifo";
+
+void *readWebSockThreadFunc(void* param)
+{
+	#define PIPEBUFFERSIZE 1024
+	int pipeFd = -1;
+	char buffer[PIPEBUFFERSIZE + 1] = {0};
+	printf("readWebSockThreadFunc\n");
+    pthread_detach(pthread_self());
+	if (access(fifoName, F_OK) == -1) {
+		int res;
+		res = mkfifo(fifoName, 0777);
+		if (res != 0) {
+			//mkfifo error
+		}
+	}
+	int byteRead = 0;
+	do {
+		pipeFd = open(fifoName, O_RDONLY);
+		if (pipeFd != -1) {
+			byteRead = read(pipeFd, buffer, PIPEBUFFERSIZE);
+			printf("reading %d: %s\n", byteRead, buffer);
+			broadcastMsg(buffer, byteRead);
+			close(pipeFd);
+		}
+	}while (1);
+    printf("readWebSockThreadFunc exit\n");
 }
 
 void printUsage(char* appname){
@@ -471,6 +546,10 @@ int main(int argc, char** argv)
     printf("opened %s:%d\n", inet_ntoa(local.sin_addr), ntohs(local.sin_port));
     
     ptasklist = list_new();
+	pthread_mutex_init(&taskListMutex,NULL);
+
+	pthread_t broadcaseThreadHandle;
+    pthread_create(&broadcaseThreadHandle, NULL, readWebSockThreadFunc, NULL);
     
     while (TRUE) {
         struct sockaddr_in remote;
@@ -483,8 +562,6 @@ int main(int argc, char** argv)
         printf("connected %s:%d\n", inet_ntoa(remote.sin_addr), ntohs(remote.sin_port));
         runClientThread(clientSocket);
         checkDeadThread();
-        //clientWorker(clientSocket);
-        //printf("disconnected\n");
     }
     
     close(listenSocket);
