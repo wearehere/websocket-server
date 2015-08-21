@@ -39,7 +39,7 @@
 
 //#define PORT 8088
 #define BUF_LEN 0xFFFF
-#define PACKET_DUMP
+//#define PACKET_DUMP
 #define TASK_FLAG_RUNNING 1
 #define TASK_FLAG_IDLE 0
 
@@ -148,8 +148,7 @@ void checkDeadThread(){
 char* runShellCommand(char* cmdline){
     FILE* fp = NULL;
     char* presp = NULL;
-    char readbuf[256];
-    int maxlen = 10240;
+    int maxlen = 102400;
     int curlen = 0;
     int status = 0;
     LOG("runShellCommand")
@@ -160,10 +159,13 @@ char* runShellCommand(char* cmdline){
     presp = (char*)malloc(maxlen);
     memset(presp, 0x00, maxlen);
     while(!feof(fp)){
-        memset(readbuf, 0x00, sizeof(readbuf));
-        fgets(readbuf, sizeof(readbuf), fp);
-        LOG(readbuf)
-        strcat(presp, readbuf);
+        if(fgets(presp +curlen, maxlen - curlen, fp) ==  NULL){
+            perror("runShellCommand[read error]:");
+            break;
+        }
+        #ifdef PACKET_DUMP
+        LOG(presp)
+        #endif
         curlen = strlen(presp);
     }
     waitpid(-1, &status, 0);
@@ -265,7 +267,9 @@ int normalClientState(char* inmsg, int inmsglen,
         }else{
             char* presp = runScript(appoption.pcgiscript, recievedString);
             if(presp != NULL){
+                #ifdef PACKET_DUMP
                 fprintf(stdout, "SCRIPT RESP:%s\n", presp);
+                #endif 
                 wsMakeFrame(presp, strlen(presp), outmsg, (size_t*)outmsglen, WS_TEXT_FRAME);
                 //wsMakeFrame(recievedString, dataSize, gBuffer, &frameSize, WS_TEXT_FRAME);
                 free(presp);
@@ -343,8 +347,8 @@ void clientWorker(ClientTaskInfo* pinfo){
     int outmsglen = 0;
     int inmsglen = 0;
     
-    memset(pinmsgbuf, 0x00, sizeof(BUF_LEN));
-    memset(poutmsg, 0x00, sizeof(BUF_LEN));
+    memset(pinmsgbuf, 0x00, BUF_LEN);
+    memset(poutmsg, 0x00, BUF_LEN);
 
     while(1){
         
@@ -359,7 +363,7 @@ void clientWorker(ClientTaskInfo* pinfo){
             close(clientSocket);
             fprintf(stdout, "[clientWorker]readed <= 0\n");
             perror("recv failed\n");
-            return;
+            break;
         }
         #ifdef PACKET_DUMP
         printf("in packet:%d\n", (int)readed);
@@ -400,6 +404,7 @@ void clientWorker(ClientTaskInfo* pinfo){
                 int ret = EXIT_FAILURE;
 
                 pthread_mutex_lock(&pinfo->sendMsgMutex);
+                fprintf(stdout, "[clientWorker]send data out\n");
                 ret = safeSend(clientSocket, poutmsg, outmsglen);
                 pthread_mutex_unlock(&pinfo->sendMsgMutex);
                 if (ret == EXIT_FAILURE){
@@ -408,7 +413,7 @@ void clientWorker(ClientTaskInfo* pinfo){
                     break;
                 }                
             }
-            memset(poutmsg, 0x00, sizeof(BUF_LEN)); outmsglen = 0;
+            memset(poutmsg, 0x00, BUF_LEN); outmsglen = 0;
             if(ret == -1){
                 break;
             }
@@ -432,7 +437,7 @@ void broadcastMsg(char *msg, int size)
     char *pmsgbuf = (char *)malloc(BUF_LEN);
     size_t frameSize = BUF_LEN;
     wsMakeFrame(msg, size, pmsgbuf, &frameSize, WS_TEXT_FRAME);
-    LOG("run broadcaseMsg")
+    LOG("run broadcastMsg")
 
     pthread_mutex_lock(&taskListMutex);
     it = list_iterator_new(ptasklist, LIST_HEAD);
