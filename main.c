@@ -129,18 +129,24 @@ void checkDeadThread(){
     ClientTaskInfo* ptask = NULL;
     list_node_t *node;    
     pthread_mutex_lock(&taskListMutex);
-    list_iterator_t *it = list_iterator_new(ptasklist, LIST_HEAD);
-    while ((node = list_iterator_next(it))) {
-        ptask = (ClientTaskInfo*)(node->val);
-        if(ptask->runflag == TASK_FLAG_IDLE){
-            LOG("checkDeadThread:remove one Dead thread")
-            list_remove(ptasklist, node);
-            FREE_MEM(ptask->prunurl)
-            pthread_mutex_destroy(&ptask->sendMsgMutex);
-            free(ptask);
+    int found = 0;
+    do{
+        found = 0;
+        list_iterator_t *it = list_iterator_new(ptasklist, LIST_HEAD);
+        while ((node = list_iterator_next(it))) {
+            ptask = (ClientTaskInfo*)(node->val);
+            if(ptask->runflag == TASK_FLAG_IDLE){
+                LOG("checkDeadThread:remove one Dead thread")
+                list_remove(ptasklist, node);
+                FREE_MEM(ptask->prunurl)
+                pthread_mutex_destroy(&ptask->sendMsgMutex);
+                free(ptask);
+                found = 1;
+                break;
+            }
         }
-    }
-    list_iterator_destroy(it);    
+        list_iterator_destroy(it);    
+    }while(found == 1);
     pthread_mutex_unlock(&taskListMutex);
 }
 
