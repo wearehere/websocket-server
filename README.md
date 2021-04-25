@@ -1,6 +1,6 @@
 # websocket-server
 
-##What is websocket-server
+## What is websocket-server
 
 base on (https://github.com/m8rge/cwebsocket)
 
@@ -9,17 +9,19 @@ add multi user support
 add cgi like script support
 
 
-##Usage
+## Usage
 
-####compile
+#### compile
 
 just run compile.sh
 
-####run:
+#### run:
 
+```sh
 websocket -p port -a authscript -r runscript
+```
 
-######authscript
+###### authscript
 
 the command to check if url is valid
 
@@ -27,7 +29,7 @@ It will be invoked with 2 params, username first, passwd second
 
 and should output "true" or "false" to standard output
 
-######runscript 
+###### runscript 
 
 the script handle other text message
 
@@ -35,9 +37,9 @@ It will be invoked by 1 param, text message
 
 and should output any response to standard output
 
-##sample
+## sample
 
-####auth script
+#### auth script
 <pre><code>
 #!/bin/sh
 user=$1
@@ -49,14 +51,14 @@ else
 fi
 </code></pre>
 
-####runscript
+#### runscript
 <pre><code>
 #!/bin/sh
 echo $1
 </code></pre>
 
 
-##contact
+## contact
 
 * Mail(64029000#qq.com)
 
